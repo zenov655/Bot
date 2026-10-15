@@ -25,6 +25,7 @@ from app.storage import (
     set_order_comment,
     save_donate_comment,
     list_donate_comments,
+    list_orders_with_comments,
 )
 
 
@@ -49,6 +50,12 @@ PENDING_RECEIPTS: dict[int, int] = {}
 
 # Ожидание текста комментария: user_id -> цель ("donate" или "order:<id>")
 PENDING_COMMENT: dict[int, str] = {}
+
+# Сообщение-приглашение написать комментарий: user_id -> message_id (чтобы убрать кнопку «Пропустить»)
+COMMENT_PROMPT_MSG: dict[int, int] = {}
+
+# Тексты кнопок главного меню — их не считаем комментарием
+MENU_BUTTON_TEXTS: set[str] = {VIP_MENU_TEXT, "🍪Донатик🍪"}
 
 # Ожидание ответа администратора клиенту: admin_id -> (user_id, order_id)
 ADMIN_REPLY_TARGET: dict[int, tuple[int, int]] = {}
@@ -85,10 +92,82 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+async def soft_restart() -> None:
+    """Мягкий сброс: очищает состояние и застрявшую очередь обновлений.
+
+    Бот при этом не выключается — просто «разгружается», если интерфейс лагает.
+    """
+    PENDING_RECEIPTS.clear()
+    PENDING_COMMENT.clear()
+    COMMENT_PROMPT_MSG.clear()
+    ADMIN_REPLY_TARGET.clear()
+
+    # Если бот работает через вебхук — переустанавливаем его,
+    # попутно отбрасывая накопившуюся очередь обновлений.
+    base = (settings.webhook_url or "").strip()
+    webhook_url = ""
+    if base:
+        if base.endswith("/telegram-webhook"):
+            webhook_url = base
+        elif base.endswith("/telegram-webhook/"):
+            webhook_url = base.rstrip("/")
+        else:
+            webhook_url = base.rstrip("/") + "/telegram-webhook"
+
+    if webhook_url:
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            await bot.set_webhook(webhook_url)
+        except Exception:
+            pass
+
+
+async def send_admin_comments(message: types.Message) -> None:
+    """Показать администратору все комментарии (к донатам и к заказам)."""
+    donate_rows = list_donate_comments()
+    order_rows = list_orders_with_comments()
+
+    blocks: list[str] = []
+
+    if donate_rows:
+        lines = []
+        for r in donate_rows:
+            username = f"@{r['username']}" if r.get("username") else "(нет username)"
+            lines.append(
+                f"#{r['id']} [{r['created_at']}] {r['full_name']} {username}\n"
+                f"💬 {r['comment']}"
+            )
+        blocks.append("🍪 Комментарии к донатам:\n\n" + "\n\n".join(lines))
+
+    if order_rows:
+        lines = []
+        for o in order_rows:
+            username = f"@{o['username']}" if o.get("username") else "(нет username)"
+            lines.append(
+                f"Заказ #{o['id']} [{o['created_at']}] {o['full_name']} {username}\n"
+                f"💬 {o['comment']}"
+            )
+        blocks.append("🥕 Комментарии к заказам:\n\n" + "\n\n".join(lines))
+
+    if not blocks:
+        await message.answer(
+            "Комментариев пока нет.",
+            reply_markup=admin_main_menu_keyboard(),
+        )
+        return
+
+    await message.answer(
+        "\n\n➖➖➖\n\n".join(blocks),
+        reply_markup=admin_main_menu_keyboard(),
+    )
+
+
 def admin_main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Админ: заказы в ожидании")],
+            [KeyboardButton(text="Админ: комментарии")],
+            [KeyboardButton(text="🔁 Перезапустить")],
         ],
         resize_keyboard=True,
     )
@@ -97,6 +176,7 @@ def admin_main_menu_keyboard() -> ReplyKeyboardMarkup:
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     PENDING_COMMENT.pop(message.from_user.id, None)
+    COMMENT_PROMPT_MSG.pop(message.from_user.id, None)
     if message.from_user.id in ADMIN_IDS:
         ADMIN_REPLY_TARGET.pop(message.from_user.id, None)
     if message.from_user.id in ADMIN_IDS:
@@ -140,7 +220,8 @@ async def handle_admin_reply(message: types.Message):
 @dp.message(
     F.text,
     ~F.text.startswith("/"),
-    lambda m: m.from_user.id in PENDING_COMMENT,
+    lambda m: m.from_user.id in PENDING_COMMENT
+    and (m.text or "").strip() not in MENU_BUTTON_TEXTS,
 )
 async def handle_pending_comment(message: types.Message):
     """Пользователь прислал текст комментария к донату или заказу."""
@@ -152,6 +233,18 @@ async def handle_pending_comment(message: types.Message):
     if not comment:
         await message.answer("Комментарий пуст. Отправь текст или нажми /start.")
         return
+
+    # Убираем кнопку «Пропустить» с приглашения
+    prompt_id = COMMENT_PROMPT_MSG.pop(message.from_user.id, None)
+    if prompt_id:
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=message.chat.id,
+                message_id=prompt_id,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
 
     if target == "donate":
         record = save_donate_comment(
@@ -212,6 +305,12 @@ async def handle_text_menu(message: types.Message):
     raw_text = (message.text or "").strip()
     text = raw_text.lower()
 
+    # Если пользователь был в режиме ввода комментария и нажал кнопку меню —
+    # отменяем ввод, чтобы кнопка не попала в комментарий.
+    if raw_text in MENU_BUTTON_TEXTS:
+        PENDING_COMMENT.pop(message.from_user.id, None)
+        COMMENT_PROMPT_MSG.pop(message.from_user.id, None)
+
     if raw_text == VIP_MENU_TEXT or text == "питти vip club":
         # Один тип заказа "Питти vip"
         orders_keyboard = InlineKeyboardMarkup(
@@ -243,12 +342,6 @@ async def handle_text_menu(message: types.Message):
                     InlineKeyboardButton(
                         text="Оплата СберБанк",
                         callback_data="donate:sberbank",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="💬 Оставить комментарий",
-                        callback_data="donate:comment",
                     )
                 ],
             ]
@@ -287,6 +380,20 @@ async def handle_text_menu(message: types.Message):
             await message.answer(text, reply_markup=keyboard)
         await message.answer(
             "Это все заказы в ожидании.",
+            reply_markup=admin_main_menu_keyboard(),
+        )
+    elif (
+        text == "админ: комментарии"
+        and message.from_user.id in ADMIN_IDS
+    ):
+        await send_admin_comments(message)
+    elif (
+        text == "🔁 перезапустить"
+        and message.from_user.id in ADMIN_IDS
+    ):
+        await soft_restart()
+        await message.answer(
+            "✅ Бот перезапущен. Очередь и состояние сброшены.",
             reply_markup=admin_main_menu_keyboard(),
         )
 
@@ -337,12 +444,6 @@ async def handle_callback(query: CallbackQuery):
                                 callback_data=f"paid:{order['id']}",
                             )
                         ],
-                        [
-                            InlineKeyboardButton(
-                                text="💬 Комментарий к заказу",
-                                callback_data=f"order_comment:{order['id']}",
-                            )
-                        ],
                     ]
                 )
                 await query.answer()
@@ -380,12 +481,6 @@ async def handle_callback(query: CallbackQuery):
                         callback_data=f"paid:{order_id}",
                     )
                 ],
-                [
-                    InlineKeyboardButton(
-                        text="💬 Комментарий к заказу",
-                        callback_data=f"order_comment:{order_id}",
-                    )
-                ],
             ]
         )
 
@@ -396,42 +491,35 @@ async def handle_callback(query: CallbackQuery):
             f"🍓Карта СберБанк: {CARD_NUMBER}\n"
             "🍓Получатель: Максим З."
         )
-        comment_kb = InlineKeyboardMarkup(
+        await query.message.answer(text)
+
+        # Сразу предлагаем оставить комментарий (необязательно)
+        PENDING_COMMENT[query.from_user.id] = "donate"
+        skip_kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="💬 Оставить комментарий",
-                        callback_data="donate:comment",
+                        text="Пропустить",
+                        callback_data="skip_comment",
                     )
                 ],
             ]
         )
-        await query.message.answer(text, reply_markup=comment_kb)
-        await query.answer()
-    elif data == "donate:comment":
-        PENDING_COMMENT[query.from_user.id] = "donate"
-        await query.answer()
-        await query.message.answer(
-            "✍️ Напиши свой комментарий к донату одним сообщением.\n"
-            "Он сохранится и сразу уйдёт автору."
+        prompt = await query.message.answer(
+            "✍️ Напиши комментарий к донату одним сообщением — он сразу уйдёт автору.\n"
+            "Если не хочешь, нажми «Пропустить».",
+            reply_markup=skip_kb,
         )
-    elif data.startswith("order_comment:"):
+        COMMENT_PROMPT_MSG[query.from_user.id] = prompt.message_id
+        await query.answer()
+    elif data == "skip_comment":
+        PENDING_COMMENT.pop(query.from_user.id, None)
+        COMMENT_PROMPT_MSG.pop(query.from_user.id, None)
         try:
-            order_id = int(data.split(":", 1)[1])
-        except ValueError:
-            await query.answer("Некорректный ID заказа", show_alert=True)
-            return
-
-        order = get_order(order_id)
-        if not order or order["user_id"] != query.from_user.id:
-            await query.answer("Заказ не найден", show_alert=True)
-            return
-
-        PENDING_COMMENT[query.from_user.id] = f"order:{order_id}"
+            await query.message.edit_text("Хорошо, комментарий пропущен.")
+        except Exception:
+            pass
         await query.answer()
-        await query.message.answer(
-            f"✍️ Напиши комментарий к заказу #{order_id} одним сообщением."
-        )
     elif data.startswith("paybank:"):
         # Пользователь выбрал банк для оплаты конкретного заказа
         try:
@@ -672,22 +760,24 @@ async def cmd_admin_orders(message: types.Message):
 
 @dp.message(Command("comments"))
 async def cmd_admin_comments(message: types.Message):
-    """Показать последние комментарии к донатам (для админа)."""
+    """Показать комментарии (к донатам и к заказам) — для админа."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    rows = list_donate_comments()
-    if not rows:
-        await message.answer("Комментариев к донатам пока нет.")
+    await send_admin_comments(message)
+
+
+@dp.message(Command("restart"))
+async def cmd_admin_restart(message: types.Message):
+    """Мягкий перезапуск бота — для админа."""
+    if message.from_user.id not in ADMIN_IDS:
         return
 
-    lines = []
-    for r in rows:
-        username = f"@{r['username']}" if r.get("username") else "(нет username)"
-        lines.append(
-            f"#{r['id']} [{r['created_at']}] {r['full_name']} {username}\n💬 {r['comment']}"
-        )
-    await message.answer("Комментарии к донатам:\n\n" + "\n\n".join(lines))
+    await soft_restart()
+    await message.answer(
+        "✅ Бот перезапущен. Очередь и состояние сброшены.",
+        reply_markup=admin_main_menu_keyboard(),
+    )
 
 
 @dp.message(Command("confirm"))

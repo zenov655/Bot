@@ -108,6 +108,19 @@ def list_donate_comments(limit: int = 50) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def list_orders_with_comments(limit: int = 50) -> List[Dict[str, Any]]:
+    """Заказы, к которым оставлен комментарий (для админа)."""
+    init_db()
+    with _get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM orders "
+            "WHERE comment IS NOT NULL AND TRIM(comment) <> '' "
+            "ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def list_orders_by_status(status: str) -> List[Dict[str, Any]]:
     init_db()
     with _get_conn() as conn:
