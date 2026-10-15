@@ -29,6 +29,24 @@ def init_db() -> None:
                 full_name TEXT,
                 amount INTEGER NOT NULL,
                 status TEXT NOT NULL,
+                comment TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        # Миграция старых баз: колонка comment могла отсутствовать.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(orders)")}
+        if "comment" not in columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN comment TEXT")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS donate_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                full_name TEXT,
+                comment TEXT NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             """
@@ -58,6 +76,36 @@ def set_order_status(order_id: int, status: str) -> None:
     init_db()
     with _get_conn() as conn:
         conn.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
+
+
+def set_order_comment(order_id: int, comment: str) -> None:
+    init_db()
+    with _get_conn() as conn:
+        conn.execute("UPDATE orders SET comment = ? WHERE id = ?", (comment, order_id))
+
+
+def save_donate_comment(user_id: int, username: Optional[str], full_name: str, comment: str) -> Dict[str, Any]:
+    """Сохранить комментарий к донату (сумма неизвестна боту — перевод идёт напрямую на карту)."""
+    init_db()
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO donate_comments (user_id, username, full_name, comment) VALUES (?, ?, ?, ?)",
+            (user_id, username, full_name, comment),
+        )
+        row_id = cur.lastrowid
+        row = conn.execute("SELECT * FROM donate_comments WHERE id = ?", (row_id,)).fetchone()
+    return dict(row)
+
+
+def list_donate_comments(limit: int = 50) -> List[Dict[str, Any]]:
+    """Последние комментарии к донатам (для админа)."""
+    init_db()
+    with _get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM donate_comments ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def list_orders_by_status(status: str) -> List[Dict[str, Any]]:

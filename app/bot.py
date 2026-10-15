@@ -22,6 +22,9 @@ from app.storage import (
     list_orders_by_status,
     list_user_orders,
     set_order_status,
+    set_order_comment,
+    save_donate_comment,
+    list_donate_comments,
 )
 
 
@@ -44,6 +47,9 @@ CARD_NUMBER = "4276300043627325"
 # Ожидание квитанции по конкретному заказу: user_id -> order_id
 PENDING_RECEIPTS: dict[int, int] = {}
 
+# Ожидание текста комментария: user_id -> цель ("donate" или "order:<id>")
+PENDING_COMMENT: dict[int, str] = {}
+
 # Ожидание ответа администратора клиенту: admin_id -> (user_id, order_id)
 ADMIN_REPLY_TARGET: dict[int, tuple[int, int]] = {}
 
@@ -58,12 +64,16 @@ def format_order(order: dict) -> str:
         "cancelled": "Отменён",
     }
     status_human = status_map.get(order["status"], order["status"])
-    return (
+    text = (
         f"Заказ #{order['id']}\n"
         f"Пользователь: {order['full_name']} {username}\n"
         f"Сумма: {order['amount']} ₽\n"
         f"Статус: {status_human}"
     )
+    comment = (order.get("comment") or "").strip()
+    if comment:
+        text += f"\n💬 Комментарий: {comment}"
+    return text
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -86,6 +96,7 @@ def admin_main_menu_keyboard() -> ReplyKeyboardMarkup:
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
+    PENDING_COMMENT.pop(message.from_user.id, None)
     if message.from_user.id in ADMIN_IDS:
         ADMIN_REPLY_TARGET.pop(message.from_user.id, None)
     if message.from_user.id in ADMIN_IDS:
@@ -124,6 +135,72 @@ async def handle_admin_reply(message: types.Message):
 
     ADMIN_REPLY_TARGET.pop(message.from_user.id, None)
     await message.answer(f"Отправлено пользователю по заказу #{order_id}.")
+
+
+@dp.message(
+    F.text,
+    ~F.text.startswith("/"),
+    lambda m: m.from_user.id in PENDING_COMMENT,
+)
+async def handle_pending_comment(message: types.Message):
+    """Пользователь прислал текст комментария к донату или заказу."""
+    if message.from_user.id in ADMIN_IDS and message.from_user.id in ADMIN_REPLY_TARGET:
+        return
+
+    target = PENDING_COMMENT.pop(message.from_user.id)
+    comment = (message.text or "").strip()
+    if not comment:
+        await message.answer("Комментарий пуст. Отправь текст или нажми /start.")
+        return
+
+    if target == "donate":
+        record = save_donate_comment(
+            user_id=message.from_user.id,
+            username=message.from_user.username,
+            full_name=message.from_user.full_name,
+            comment=comment,
+        )
+        await message.answer(
+            "💬 Спасибо! Комментарий сохранён и передан автору."
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    (
+                        f"💬 Комментарий к донату #{record['id']}\n"
+                        f"От: {message.from_user.full_name} "
+                        f"(@{message.from_user.username or 'нет username'})\n"
+                        f"Текст: {comment}"
+                    ),
+                )
+            except Exception:
+                pass
+    elif target.startswith("order:"):
+        try:
+            order_id = int(target.split(":", 1)[1])
+        except ValueError:
+            return
+        order = get_order(order_id)
+        if not order or order["user_id"] != message.from_user.id:
+            await message.answer("Заказ не найден.")
+            return
+
+        set_order_comment(order_id, comment)
+        await message.answer(f"💬 Комментарий к заказу #{order_id} сохранён.")
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    (
+                        f"💬 Комментарий к заказу #{order_id}\n"
+                        f"От: {message.from_user.full_name} "
+                        f"(@{message.from_user.username or 'нет username'})\n"
+                        f"Текст: {comment}"
+                    ),
+                )
+            except Exception:
+                pass
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
@@ -166,6 +243,12 @@ async def handle_text_menu(message: types.Message):
                     InlineKeyboardButton(
                         text="Оплата СберБанк",
                         callback_data="donate:sberbank",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="💬 Оставить комментарий",
+                        callback_data="donate:comment",
                     )
                 ],
             ]
@@ -254,6 +337,12 @@ async def handle_callback(query: CallbackQuery):
                                 callback_data=f"paid:{order['id']}",
                             )
                         ],
+                        [
+                            InlineKeyboardButton(
+                                text="💬 Комментарий к заказу",
+                                callback_data=f"order_comment:{order['id']}",
+                            )
+                        ],
                     ]
                 )
                 await query.answer()
@@ -291,6 +380,12 @@ async def handle_callback(query: CallbackQuery):
                         callback_data=f"paid:{order_id}",
                     )
                 ],
+                [
+                    InlineKeyboardButton(
+                        text="💬 Комментарий к заказу",
+                        callback_data=f"order_comment:{order_id}",
+                    )
+                ],
             ]
         )
 
@@ -301,8 +396,42 @@ async def handle_callback(query: CallbackQuery):
             f"🍓Карта СберБанк: {CARD_NUMBER}\n"
             "🍓Получатель: Максим З."
         )
-        await query.message.answer(text)
+        comment_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="💬 Оставить комментарий",
+                        callback_data="donate:comment",
+                    )
+                ],
+            ]
+        )
+        await query.message.answer(text, reply_markup=comment_kb)
         await query.answer()
+    elif data == "donate:comment":
+        PENDING_COMMENT[query.from_user.id] = "donate"
+        await query.answer()
+        await query.message.answer(
+            "✍️ Напиши свой комментарий к донату одним сообщением.\n"
+            "Он сохранится и сразу уйдёт автору."
+        )
+    elif data.startswith("order_comment:"):
+        try:
+            order_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await query.answer("Некорректный ID заказа", show_alert=True)
+            return
+
+        order = get_order(order_id)
+        if not order or order["user_id"] != query.from_user.id:
+            await query.answer("Заказ не найден", show_alert=True)
+            return
+
+        PENDING_COMMENT[query.from_user.id] = f"order:{order_id}"
+        await query.answer()
+        await query.message.answer(
+            f"✍️ Напиши комментарий к заказу #{order_id} одним сообщением."
+        )
     elif data.startswith("paybank:"):
         # Пользователь выбрал банк для оплаты конкретного заказа
         try:
@@ -352,6 +481,8 @@ async def handle_callback(query: CallbackQuery):
         await query.message.edit_reply_markup(reply_markup=None)
 
         # Уведомляем администраторов о том, что пользователь сообщил об оплате
+        order_comment = (order.get("comment") or "").strip()
+        comment_line = f"\n💬 Комментарий: {order_comment}" if order_comment else ""
         for admin_id in ADMIN_IDS:
             try:
                 admin_keyboard = InlineKeyboardMarkup(
@@ -369,6 +500,7 @@ async def handle_callback(query: CallbackQuery):
                     (
                         f"Пользователь {order['full_name']} (@{order.get('username') or 'нет username'}) "
                         f"сообщил об оплате заказа #{order_id}. Ожидается квитанция."
+                        f"{comment_line}"
                     ),
                     reply_markup=admin_keyboard,
                 )
@@ -536,6 +668,26 @@ async def cmd_admin_orders(message: types.Message):
 
     lines = [format_order(o) for o in waiting]
     await message.answer("Заказы в ожидании:\n\n" + "\n\n".join(lines))
+
+
+@dp.message(Command("comments"))
+async def cmd_admin_comments(message: types.Message):
+    """Показать последние комментарии к донатам (для админа)."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    rows = list_donate_comments()
+    if not rows:
+        await message.answer("Комментариев к донатам пока нет.")
+        return
+
+    lines = []
+    for r in rows:
+        username = f"@{r['username']}" if r.get("username") else "(нет username)"
+        lines.append(
+            f"#{r['id']} [{r['created_at']}] {r['full_name']} {username}\n💬 {r['comment']}"
+        )
+    await message.answer("Комментарии к донатам:\n\n" + "\n\n".join(lines))
 
 
 @dp.message(Command("confirm"))
